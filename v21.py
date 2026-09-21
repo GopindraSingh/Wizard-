@@ -3,7 +3,7 @@
 NSE INTRADAY 09:45 SHORT-BIASED SCANNER - V2
 ====================================================================
 
-V2 OBJECTIVES
+V2 OBJECTIVES 
 --------------
 Designed around the 09:45 IST decision point.
 
