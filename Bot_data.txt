@@ -33,6 +33,11 @@ For a description of the Bot API, see this page: https://core.telegram.org/bots/
 
 
 
+def get_access_token():
+    token = os.getenv("eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI1U0NRTEMiLCJqdGkiOiI2YWIxOTQyYzExMDA2ZDE4Nzk5NzVlNjYiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaXNFeHRlbmRlZCI6dHJ1ZSwiaWF0IjoxNzkwMDIyNzAwLCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE4MjE1NjQwMDB9.hZWxTPTvOA5c_mpXk95aXNovdRq5gXQvDwEMzM3EUdk")
+
+    if not token:
+        print()
 
 
 
@@ -40,6 +45,3 @@ For a description of the Bot API, see this page: https://core.telegram.org/bots/
 
 
 
-
-
-eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI1U0NRTEMiLCJqdGkiOiI2YTk5YWY2OTU2MmQwMDEyM2IxZjUwODEiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaXNFeHRlbmRlZCI6dHJ1ZSwiaWF0IjoxNzg4NDU2ODA5LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE4MjAwMDg4MDB9.LzDPElKzGy6OlALylVeK-wq_sofrj9zg93QogPL2zvU
