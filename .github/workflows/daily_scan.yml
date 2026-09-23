@@ -17,15 +17,30 @@ jobs:
 
     runs-on: ubuntu-latest
 
-    timeout-minutes: 15
+    # Allow enough time for:
+    # - environment setup
+    # - NSE universe download
+    # - NIFTY download
+    # - Yahoo Finance stock batches
+    # - calculations
+    # - Telegram delivery
+    timeout-minutes: 20
 
     env:
       TZ: Asia/Kolkata
 
     steps:
 
+      # ==========================================================
+      # CHECKOUT
+      # ==========================================================
+
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      # ==========================================================
+      # PYTHON
+      # ==========================================================
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -33,17 +48,67 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
+      # ==========================================================
+      # INSTALL
+      # ==========================================================
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # ==========================================================
+      # ENVIRONMENT DIAGNOSTICS
+      # ==========================================================
+
+      - name: Verify environment
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          echo "UTC time:"
+          date -u
+
+          echo ""
+          echo "IST time:"
+          TZ=Asia/Kolkata date
+
+          echo ""
+          echo "Python:"
+          python --version
+
+          echo ""
+          echo "Telegram bot token configured:"
+          if [ -n "$TELEGRAM_BOT_TOKEN" ]; then
+            echo "YES"
+          else
+            echo "NO"
+            exit 1
+          fi
+
+          echo ""
+          echo "Telegram chat ID configured:"
+          if [ -n "$TELEGRAM_CHAT_ID" ]; then
+            echo "YES"
+          else
+            echo "NO"
+            exit 1
+          fi
+
+      # ==========================================================
+      # RUN SCANNER
+      # ==========================================================
+
       - name: Run single 09:46 IST live scan
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets."eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI1U0NRTEMiLCJqdGkiOiI2YWIxOTQyYzExMDA2ZDE4Nzk5NzVlNjYiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaXNFeHRlbmRlZCI6dHJ1ZSwiaWF0IjoxNzkwMDIyNzAwLCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE4MjE1NjQwMDB9.hZWxTPTvOA5c_mpXk95aXNovdRq5gXQvDwEMzM3EUdk"}}
+          TELEGRAM_BOT_TOKEN: ${{ secrets."8984037851:AAGnc5Tm088pqdilp8kL-I5giUXylP8hRQQ"}}
           TELEGRAM_CHAT_ID: ${{ secrets."1860594381"}}
+
           MIN_TURNOVER_CR: "2.0"
           TOP_SHORTS_TO_SHOW: "5"
           TOP_LONGS_TO_SHOW: "3"
+
+          LOG_LEVEL: "INFO"
+
         run: |
           python runner.py
