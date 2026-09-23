@@ -131,12 +131,12 @@ TOP_LONGS_TO_SHOW = int(
 # ================================================================
 
 TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN",
+    "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI1U0NRTEMiLCJqdGkiOiI2YWIxOTQyYzExMDA2ZDE4Nzk5NzVlNjYiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaXNFeHRlbmRlZCI6dHJ1ZSwiaWF0IjoxNzkwMDIyNzAwLCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE4MjE1NjQwMDB9.hZWxTPTvOA5c_mpXk95aXNovdRq5gXQvDwEMzM3EUdk",
     ""
 )
 
 TELEGRAM_CHAT_ID = os.getenv(
-    "TELEGRAM_CHAT_ID",
+    "1860594381",
     ""
 )
 
