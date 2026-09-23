@@ -2,9 +2,7 @@
 NSE 09:45 LIVE SHORT-BIASED SCANNER
 ===================================
 
-Live-only production scanner.
-
-Designed execution:
+Execution target:
     09:46 IST
 
 Signal candles:
@@ -37,14 +35,28 @@ from __future__ import annotations
 
 import contextlib
 import io
+import logging
 import os
 import time
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
+
+
+# ================================================================
+# LOGGING
+# ================================================================
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
+logger = logging.getLogger("nse_scanner")
 
 
 # ================================================================
@@ -114,7 +126,7 @@ MAX_OPENING_COLLAPSE = 3.0
 NIFTY50_TICKER = "^NSEI"
 
 BATCH_SIZE = 40
-DOWNLOAD_TIMEOUT = 20
+DOWNLOAD_TIMEOUT = 30
 BATCH_DELAY = 0.8
 
 TOP_SHORTS_TO_SHOW = int(
@@ -127,22 +139,47 @@ TOP_LONGS_TO_SHOW = int(
 
 
 # ================================================================
-# TELEGRAM
+# TELEGRAM CONFIGURATION
 # ================================================================
+
+# IMPORTANT:
+# These are ENVIRONMENT VARIABLE NAMES.
+#
+# Do NOT put the actual Telegram token here.
+#
+# GitHub Actions should provide:
+#   TELEGRAM_BOT_TOKEN
+#   TELEGRAM_CHAT_ID
 
 TELEGRAM_BOT_TOKEN = os.getenv(
     "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI1U0NRTEMiLCJqdGkiOiI2YWIxOTQyYzExMDA2ZDE4Nzk5NzVlNjYiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaXNFeHRlbmRlZCI6dHJ1ZSwiaWF0IjoxNzkwMDIyNzAwLCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE4MjE1NjQwMDB9.hZWxTPTvOA5c_mpXk95aXNovdRq5gXQvDwEMzM3EUdk",
     ""
-)
+).strip()
 
 TELEGRAM_CHAT_ID = os.getenv(
     "1860594381",
     ""
-)
+).strip()
 
 
 # ================================================================
-# TELEGRAM FUNCTIONS
+# DATA CLASS
+# ================================================================
+
+@dataclass
+class ScanStats:
+    universe: int = 0
+    downloaded: int = 0
+    failed_download: int = 0
+    analyzed: int = 0
+    rejected_liquidity: int = 0
+    actionable: int = 0
+    shorts: int = 0
+    longs: int = 0
+
+
+# ================================================================
+# TELEGRAM
 # ================================================================
 
 def telegram_enabled() -> bool:
@@ -152,15 +189,31 @@ def telegram_enabled() -> bool:
     )
 
 
+def validate_configuration() -> None:
+    """
+    Validate critical configuration before starting the expensive scan.
+    """
+
+    missing = []
+
+    if not TELEGRAM_BOT_TOKEN:
+        missing.append("TELEGRAM_BOT_TOKEN")
+
+    if not TELEGRAM_CHAT_ID:
+        missing.append("TELEGRAM_CHAT_ID")
+
+    if missing:
+        raise RuntimeError(
+            "Missing required environment variables: "
+            + ", ".join(missing)
+        )
+
+
 def send_telegram_message(
     message: str
 ) -> None:
 
-    if not telegram_enabled():
-        raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID "
-            "is not configured."
-        )
+    validate_configuration()
 
     url = (
         "https://api.telegram.org/bot"
@@ -173,6 +226,8 @@ def send_telegram_message(
         "text": message,
         "disable_web_page_preview": True,
     }
+
+    logger.info("Sending Telegram message...")
 
     response = requests.post(
         url,
@@ -189,6 +244,8 @@ def send_telegram_message(
             f"Telegram API error: {data}"
         )
 
+    logger.info("Telegram message sent successfully.")
+
 
 # ================================================================
 # YFINANCE
@@ -203,11 +260,13 @@ def yf_download_quiet(
     stderr = io.StringIO()
 
     try:
+
         with contextlib.redirect_stdout(
             stdout
         ), contextlib.redirect_stderr(
             stderr
         ):
+
             result = yf.download(
                 *args,
                 **kwargs
@@ -218,7 +277,13 @@ def yf_download_quiet(
 
         return result
 
-    except Exception:
+    except Exception as exc:
+
+        logger.warning(
+            "Yahoo Finance download failed: %s",
+            exc,
+        )
+
         return pd.DataFrame()
 
 
@@ -301,22 +366,35 @@ def build_universe() -> List[str]:
         NIFTY_500_URL
     )
 
+    logger.info(
+        "NIFTY 500 symbols downloaded: %d",
+        len(nifty500),
+    )
+
     if EXCLUDE_NIFTY50:
 
         nifty50 = get_index_symbols(
             NIFTY_50_URL
         )
 
+        logger.info(
+            "NIFTY 50 symbols downloaded: %d",
+            len(nifty50),
+        )
+
         symbols = nifty500 - nifty50
 
     else:
+
         symbols = nifty500
 
-    return [
+    universe = [
         f"{symbol}.NS"
         for symbol in sorted(symbols)
         if symbol
     ]
+
+    return universe
 
 
 # ================================================================
@@ -331,6 +409,7 @@ def flatten_columns(
         df.columns,
         pd.MultiIndex
     ):
+
         df.columns = (
             df.columns
             .get_level_values(0)
@@ -348,7 +427,14 @@ def normalize_intraday_index(
 
     df = df.copy()
 
-    df.index = pd.to_datetime(df.index)
+    df.index = pd.to_datetime(
+        df.index,
+        errors="coerce",
+    )
+
+    df = df[
+        ~df.index.isna()
+    ]
 
     if getattr(
         df.index,
@@ -365,7 +451,9 @@ def normalize_intraday_index(
 
         df.index = (
             df.index
-            .tz_localize(MARKET_TZ)
+            .tz_localize(
+                MARKET_TZ
+            )
         )
 
     return df.sort_index()
@@ -399,9 +487,10 @@ def clean_ticker_data(
     df = normalize_intraday_index(df)
 
     for column in required:
+
         df[column] = pd.to_numeric(
             df[column],
-            errors="coerce"
+            errors="coerce",
         )
 
     df = df.dropna(
@@ -413,6 +502,7 @@ def clean_ticker_data(
         & (df["High"] > 0)
         & (df["Low"] > 0)
         & (df["Close"] > 0)
+        & (df["Volume"] >= 0)
         & (df["High"] >= df["Low"])
     ]
 
@@ -438,6 +528,11 @@ def download_intraday_batch(
     end_date = (
         target_date
         + pd.Timedelta(days=1)
+    )
+
+    logger.info(
+        "Downloading batch of %d tickers...",
+        len(tickers),
     )
 
     raw = yf_download_quiet(
@@ -492,6 +587,7 @@ def download_intraday_batch(
                 continue
 
             try:
+
                 ticker_df = raw[
                     ticker
                 ].copy()
@@ -501,16 +597,25 @@ def download_intraday_batch(
                 )
 
                 if not ticker_df.empty:
+
                     results[ticker] = ticker_df
 
-            except Exception:
-                continue
+            except Exception as exc:
+
+                logger.warning(
+                    "Failed cleaning %s: %s",
+                    ticker,
+                    exc,
+                )
 
     elif len(tickers) == 1:
 
-        ticker_df = clean_ticker_data(raw)
+        ticker_df = clean_ticker_data(
+            raw
+        )
 
         if not ticker_df.empty:
+
             results[tickers[0]] = ticker_df
 
     return results
@@ -534,18 +639,70 @@ def filter_session(
 
     session_open = pd.Timestamp(
         f"{date_str} {MARKET_OPEN}",
-        tz=MARKET_TZ
+        tz=MARKET_TZ,
     )
 
     session_close = pd.Timestamp(
         f"{date_str} {MARKET_CLOSE}",
-        tz=MARKET_TZ
+        tz=MARKET_TZ,
     )
 
     return df[
         (df.index >= session_open)
         & (df.index < session_close)
     ].sort_index()
+
+
+# ================================================================
+# SIGNAL BAR VALIDATION
+# ================================================================
+
+def get_signal_bars(
+    df: pd.DataFrame,
+    target_date: pd.Timestamp
+) -> Optional[
+    Tuple[pd.Series, pd.Series]
+]:
+
+    session = filter_session(
+        df,
+        target_date,
+    )
+
+    if session.empty:
+        return None
+
+    # We only want the first two regular-session
+    # 15-minute candles:
+    #
+    # 09:15
+    # 09:30
+    #
+    # Any later candles are ignored.
+
+    expected_times = [
+        "09:15",
+        "09:30",
+    ]
+
+    bars = []
+
+    for expected_time in expected_times:
+
+        matches = session[
+            session.index.strftime(
+                "%H:%M"
+            ) == expected_time
+        ]
+
+        if matches.empty:
+            return None
+
+        bars.append(
+            matches.iloc[0]
+        )
+
+    return bars[0], bars[1]
 
 
 # ================================================================
@@ -575,7 +732,7 @@ def calculate_session_vwap(
         /
         cumulative_volume.replace(
             0,
-            np.nan
+            np.nan,
         )
     )
 
@@ -587,14 +744,19 @@ def calculate_rsi(
 
     delta = close.diff()
 
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    gain = delta.clip(
+        lower=0
+    )
+
+    loss = -delta.clip(
+        upper=0
+    )
 
     avg_gain = (
         gain.ewm(
             alpha=1 / period,
             adjust=False,
-            min_periods=period
+            min_periods=period,
         ).mean()
     )
 
@@ -602,7 +764,7 @@ def calculate_rsi(
         loss.ewm(
             alpha=1 / period,
             adjust=False,
-            min_periods=period
+            min_periods=period,
         ).mean()
     )
 
@@ -611,7 +773,7 @@ def calculate_rsi(
         /
         avg_loss.replace(
             0,
-            np.nan
+            np.nan,
         )
     )
 
@@ -621,7 +783,7 @@ def calculate_rsi(
 
     return rsi.where(
         avg_loss != 0,
-        100
+        100,
     )
 
 
@@ -637,7 +799,7 @@ def calculate_macd(
         close.ewm(
             span=MACD_FAST,
             adjust=False,
-            min_periods=MACD_FAST
+            min_periods=MACD_FAST,
         ).mean()
     )
 
@@ -645,7 +807,7 @@ def calculate_macd(
         close.ewm(
             span=MACD_SLOW,
             adjust=False,
-            min_periods=MACD_SLOW
+            min_periods=MACD_SLOW,
         ).mean()
     )
 
@@ -655,13 +817,17 @@ def calculate_macd(
         macd.ewm(
             span=MACD_SIGNAL,
             adjust=False,
-            min_periods=MACD_SIGNAL
+            min_periods=MACD_SIGNAL,
         ).mean()
     )
 
     histogram = macd - signal
 
-    return macd, signal, histogram
+    return (
+        macd,
+        signal,
+        histogram,
+    )
 
 
 def calculate_atr(
@@ -669,9 +835,13 @@ def calculate_atr(
     period: int = ATR_PERIOD
 ) -> pd.Series:
 
-    previous_close = df["Close"].shift(1)
+    previous_close = (
+        df["Close"].shift(1)
+    )
 
-    tr1 = df["High"] - df["Low"]
+    tr1 = (
+        df["High"] - df["Low"]
+    )
 
     tr2 = (
         df["High"] - previous_close
@@ -682,15 +852,19 @@ def calculate_atr(
     ).abs()
 
     true_range = pd.concat(
-        [tr1, tr2, tr3],
-        axis=1
+        [
+            tr1,
+            tr2,
+            tr3,
+        ],
+        axis=1,
     ).max(axis=1)
 
     return (
         true_range.ewm(
             alpha=1 / period,
             adjust=False,
-            min_periods=period
+            min_periods=period,
         ).mean()
     )
 
@@ -706,7 +880,7 @@ def add_features(
         .ewm(
             span=EMA_FAST,
             adjust=False,
-            min_periods=EMA_FAST
+            min_periods=EMA_FAST,
         ).mean()
     )
 
@@ -715,7 +889,7 @@ def add_features(
         .ewm(
             span=EMA_SLOW,
             adjust=False,
-            min_periods=EMA_SLOW
+            min_periods=EMA_SLOW,
         ).mean()
     )
 
@@ -726,12 +900,14 @@ def add_features(
     (
         df["MACD"],
         df["MACD_Signal"],
-        df["MACD_Hist"]
+        df["MACD_Hist"],
     ) = calculate_macd(
         df["Close"]
     )
 
-    df["ATR"] = calculate_atr(df)
+    df["ATR"] = calculate_atr(
+        df
+    )
 
     df["ATR_Pct"] = (
         df["ATR"]
@@ -740,30 +916,36 @@ def add_features(
 
     candle_range = (
         df["High"] - df["Low"]
-    ).replace(0, np.nan)
+    ).replace(
+        0,
+        np.nan,
+    )
 
-    df["Candle_Range"] = candle_range
+    df["Candle_Range"] = (
+        candle_range
+    )
 
     df["Body"] = (
         df["Close"] - df["Open"]
     ).abs()
 
     df["Candle_Strength"] = (
-        df["Body"] / candle_range
+        df["Body"]
+        / candle_range
     )
 
     df["Upper_Wick"] = (
         df["High"]
         -
-        df[["Open", "Close"]].max(
-            axis=1
-        )
+        df[
+            ["Open", "Close"]
+        ].max(axis=1)
     )
 
     df["Lower_Wick"] = (
-        df[["Open", "Close"]].min(
-            axis=1
-        )
+        df[
+            ["Open", "Close"]
+        ].min(axis=1)
         -
         df["Low"]
     )
@@ -778,10 +960,14 @@ def add_features(
         / candle_range
     )
 
-    df["Session_Date"] = df.index.date
+    df["Session_Date"] = (
+        df.index.date
+    )
 
     df["Bar_Time"] = (
-        df.index.strftime("%H:%M")
+        df.index.strftime(
+            "%H:%M"
+        )
     )
 
     return df
@@ -805,8 +991,15 @@ def calculate_rvol_for_target(
         return np.nan
 
     historical = df[
-        (df["Session_Date"] < target_date.date())
-        & (df["Bar_Time"] == bar_time)
+        (
+            df["Session_Date"]
+            < target_date.date()
+        )
+        &
+        (
+            df["Bar_Time"]
+            == bar_time
+        )
     ].copy()
 
     if historical.empty:
@@ -815,16 +1008,24 @@ def calculate_rvol_for_target(
     historical = (
         historical
         .sort_index()
-        .tail(RVOL_LOOKBACK_DAYS)
+        .tail(
+            RVOL_LOOKBACK_DAYS
+        )
     )
 
     volumes = (
         historical["Volume"]
-        .replace(0, np.nan)
+        .replace(
+            0,
+            np.nan,
+        )
         .dropna()
     )
 
-    if len(volumes) < MIN_RVOL_OBSERVATIONS:
+    if (
+        len(volumes)
+        < MIN_RVOL_OBSERVATIONS
+    ):
         return np.nan
 
     baseline = float(
@@ -834,7 +1035,10 @@ def calculate_rvol_for_target(
     if baseline <= 0:
         return np.nan
 
-    return current_volume / baseline
+    return (
+        current_volume
+        / baseline
+    )
 
 
 # ================================================================
@@ -884,7 +1088,9 @@ def download_nifty_data(
         timeout=DOWNLOAD_TIMEOUT,
     )
 
-    return clean_ticker_data(raw)
+    return clean_ticker_data(
+        raw
+    )
 
 
 def calculate_market_returns(
@@ -892,16 +1098,15 @@ def calculate_market_returns(
     target_date: pd.Timestamp
 ) -> Tuple[float, float]:
 
-    session = filter_session(
+    bars = get_signal_bars(
         nifty,
-        target_date
+        target_date,
     )
 
-    if len(session) < 2:
+    if bars is None:
         return np.nan, np.nan
 
-    opening = session.iloc[0]
-    confirmation = session.iloc[1]
+    opening, confirmation = bars
 
     opening_return = (
         (
@@ -921,7 +1126,7 @@ def calculate_market_returns(
 
     return (
         float(opening_return),
-        float(total_return)
+        float(total_return),
     )
 
 
@@ -939,7 +1144,11 @@ def clamp(
         return 0.0
 
     return float(
-        np.clip(value, low, high)
+        np.clip(
+            value,
+            low,
+            high,
+        )
     )
 
 
@@ -954,7 +1163,7 @@ def bearish_move_score(
     return clamp(
         -value_pct / scale,
         0,
-        1
+        1,
     )
 
 
@@ -969,7 +1178,7 @@ def bullish_move_score(
     return clamp(
         value_pct / scale,
         0,
-        1
+        1,
     )
 
 
@@ -990,52 +1199,85 @@ def calculate_short_exhaustion(
     flags = []
 
     if opening_pct <= -MAX_OPENING_COLLAPSE:
+
         penalty += 12
-        flags.append("opening_collapse")
+        flags.append(
+            "opening_collapse"
+        )
 
     elif opening_pct <= -2.25:
+
         penalty += 6
-        flags.append("large_opening_move")
+        flags.append(
+            "large_opening_move"
+        )
 
     if vwap_pct <= -MAX_SHORT_VWAP_DISTANCE:
+
         penalty += 12
-        flags.append("far_below_vwap")
+        flags.append(
+            "far_below_vwap"
+        )
 
     elif vwap_pct <= -2.0:
+
         penalty += 6
-        flags.append("extended_vwap")
+        flags.append(
+            "extended_vwap"
+        )
 
     if ema20_pct <= -MAX_SHORT_EMA20_DISTANCE:
+
         penalty += 10
-        flags.append("far_below_ema20")
+        flags.append(
+            "far_below_ema20"
+        )
 
     elif ema20_pct <= -2.5:
+
         penalty += 5
-        flags.append("extended_ema20")
+        flags.append(
+            "extended_ema20"
+        )
 
     if np.isfinite(rsi):
 
         if rsi <= RSI_EXTREME_OVERSOLD:
+
             penalty += 15
-            flags.append("extreme_oversold")
+            flags.append(
+                "extreme_oversold"
+            )
 
         elif rsi <= RSI_OVERSOLD:
+
             penalty += 8
-            flags.append("oversold")
+            flags.append(
+                "oversold"
+            )
 
     if np.isfinite(lower_wick_pct):
 
         if lower_wick_pct >= 0.45:
+
             penalty += 8
-            flags.append("large_lower_wick")
+            flags.append(
+                "large_lower_wick"
+            )
 
         elif lower_wick_pct >= 0.30:
+
             penalty += 4
-            flags.append("lower_wick")
+            flags.append(
+                "lower_wick"
+            )
 
     if momentum_deceleration:
+
         penalty += 8
-        flags.append("momentum_deceleration")
+        flags.append(
+            "momentum_deceleration"
+        )
 
     return penalty, flags
 
@@ -1055,18 +1297,19 @@ def analyse_at_0945(
     if full_df.empty:
         return None
 
-    df = add_features(full_df)
-
-    session = filter_session(
-        df,
-        target_date
+    df = add_features(
+        full_df
     )
 
-    if len(session) < 2:
+    bars = get_signal_bars(
+        df,
+        target_date,
+    )
+
+    if bars is None:
         return None
 
-    opening = session.iloc[0]
-    confirmation = session.iloc[1]
+    opening, confirmation = bars
 
     opening_price = float(
         opening["Open"]
@@ -1083,6 +1326,9 @@ def analyse_at_0945(
     decision_price = float(
         confirmation["Close"]
     )
+
+    if opening_price <= 0:
+        return None
 
     opening_pct = (
         (
@@ -1109,51 +1355,104 @@ def analyse_at_0945(
     ) * 100
 
     relative_total_strength = (
-        total_pct - nifty_total_return
-        if np.isfinite(nifty_total_return)
+        total_pct
+        - nifty_total_return
+        if np.isfinite(
+            nifty_total_return
+        )
         else np.nan
     )
 
-    vwap = calculate_session_vwap(session)
+    session = filter_session(
+        df,
+        target_date,
+    )
 
-    vwap_value = float(vwap.iloc[1])
+    signal_session = session[
+        session.index <= confirmation.name
+    ]
 
-    ema9 = float(confirmation["EMA9"])
-    ema20 = float(confirmation["EMA20"])
+    vwap = calculate_session_vwap(
+        signal_session
+    )
+
+    if vwap.empty:
+        return None
+
+    vwap_value = float(
+        vwap.iloc[-1]
+    )
+
+    if not np.isfinite(
+        vwap_value
+    ):
+        return None
+
+    ema9 = float(
+        confirmation["EMA9"]
+    )
+
+    ema20 = float(
+        confirmation["EMA20"]
+    )
 
     rsi = (
         float(confirmation["RSI"])
-        if pd.notna(confirmation["RSI"])
+        if pd.notna(
+            confirmation["RSI"]
+        )
         else np.nan
     )
 
     macd = (
         float(confirmation["MACD"])
-        if pd.notna(confirmation["MACD"])
+        if pd.notna(
+            confirmation["MACD"]
+        )
         else np.nan
     )
 
     macd_signal = (
-        float(confirmation["MACD_Signal"])
-        if pd.notna(confirmation["MACD_Signal"])
+        float(
+            confirmation[
+                "MACD_Signal"
+            ]
+        )
+        if pd.notna(
+            confirmation["MACD_Signal"]
+        )
         else np.nan
     )
 
     macd_hist = (
-        float(confirmation["MACD_Hist"])
-        if pd.notna(confirmation["MACD_Hist"])
+        float(
+            confirmation[
+                "MACD_Hist"
+            ]
+        )
+        if pd.notna(
+            confirmation["MACD_Hist"]
+        )
         else np.nan
     )
 
     atr = (
         float(confirmation["ATR"])
-        if pd.notna(confirmation["ATR"])
+        if pd.notna(
+            confirmation["ATR"]
+        )
         else np.nan
     )
 
     atr_pct = (
-        float(confirmation["ATR_Pct"])
-        if pd.notna(confirmation["ATR_Pct"])
+        float(
+            confirmation[
+                "ATR_Pct"
+            ]
+        )
+        if pd.notna(
+            confirmation["ATR_Pct"]
+        )
         else np.nan
     )
 
@@ -1166,6 +1465,10 @@ def analyse_at_0945(
             atr,
         ]
     ):
+
+        return None
+
+    if atr <= 0:
         return None
 
     vwap_pct = (
@@ -1205,8 +1508,6 @@ def analyse_at_0945(
             - opening_price
         )
         / atr
-        if atr > 0
-        else np.nan
     )
 
     opening_high = float(
@@ -1226,70 +1527,94 @@ def analyse_at_0945(
     )
 
     lower_low = (
-        confirmation_low < opening_low
+        confirmation_low
+        < opening_low
     )
 
     higher_high = (
-        confirmation_high > opening_high
+        confirmation_high
+        > opening_high
     )
 
     confirmation_range = float(
-        confirmation["Candle_Range"]
+        confirmation[
+            "Candle_Range"
+        ]
     )
 
     candle_strength = float(
-        confirmation["Candle_Strength"]
+        confirmation[
+            "Candle_Strength"
+        ]
     )
 
     lower_wick_pct = float(
-        confirmation["Lower_Wick_Pct"]
+        confirmation[
+            "Lower_Wick_Pct"
+        ]
     )
 
     upper_wick_pct = float(
-        confirmation["Upper_Wick_Pct"]
+        confirmation[
+            "Upper_Wick_Pct"
+        ]
     )
 
     bearish_confirmation = (
-        decision_price < confirmation_open
+        decision_price
+        < confirmation_open
     )
 
     bullish_confirmation = (
-        decision_price > confirmation_open
+        decision_price
+        > confirmation_open
     )
 
     opening_range = (
-        opening_high - opening_low
+        opening_high
+        - opening_low
     )
 
     range_expansion = (
-        confirmation_range / opening_range
+        confirmation_range
+        / opening_range
         if opening_range > 0
         else np.nan
     )
 
-    opening_rvol = calculate_rvol_for_target(
-        df,
-        target_date,
-        "09:15",
-        float(opening["Volume"])
+    opening_rvol = (
+        calculate_rvol_for_target(
+            df,
+            target_date,
+            "09:15",
+            float(
+                opening["Volume"]
+            ),
+        )
     )
 
-    confirmation_rvol = calculate_rvol_for_target(
-        df,
-        target_date,
-        "09:30",
-        float(confirmation["Volume"])
+    confirmation_rvol = (
+        calculate_rvol_for_target(
+            df,
+            target_date,
+            "09:30",
+            float(
+                confirmation["Volume"]
+            ),
+        )
     )
 
     momentum_deceleration = (
         opening_pct < -0.75
-        and confirmation_pct > opening_pct * 0.55
+        and confirmation_pct
+        > opening_pct * 0.55
         and confirmation_pct > -0.25
     )
 
     momentum_acceleration = (
         opening_pct < 0
-        and confirmation_pct < opening_pct * 0.75
+        and confirmation_pct
+        < opening_pct * 0.75
     )
 
     short_continuation = (
@@ -1336,21 +1661,21 @@ def analyse_at_0945(
     short_score += (
         12 * bearish_move_score(
             opening_pct,
-            1.50
+            1.50,
         )
     )
 
     short_score += (
         12 * bearish_move_score(
             confirmation_pct,
-            1.00
+            1.00,
         )
     )
 
     short_score += (
         12 * bearish_move_score(
             relative_total_strength,
-            1.50
+            1.50,
         )
     )
 
@@ -1358,7 +1683,7 @@ def analyse_at_0945(
         10 * clamp(
             -vwap_pct / 2.0,
             0,
-            1
+            1,
         )
     )
 
@@ -1370,7 +1695,9 @@ def analyse_at_0945(
     if ema9 < ema20:
         ema_structure += 0.50
 
-    short_score += 10 * ema_structure
+    short_score += (
+        10 * ema_structure
+    )
 
     macd_structure = 0.0
 
@@ -1388,31 +1715,51 @@ def analyse_at_0945(
         macd_structure += 0.40
 
     short_score += (
-        8 * min(1.0, macd_structure)
+        8 * min(
+            1.0,
+            macd_structure,
+        )
     )
 
     volume_strength = 0.0
 
-    if np.isfinite(opening_rvol):
+    if np.isfinite(
+        opening_rvol
+    ):
+
         volume_strength += (
             clamp(
-                (opening_rvol - 1.0) / 1.5,
+                (
+                    opening_rvol
+                    - 1.0
+                ) / 1.5,
                 0,
-                1
-            ) * 0.40
+                1,
+            )
+            * 0.40
         )
 
-    if np.isfinite(confirmation_rvol):
+    if np.isfinite(
+        confirmation_rvol
+    ):
+
         volume_strength += (
             clamp(
-                (confirmation_rvol - 1.0) / 1.5,
+                (
+                    confirmation_rvol
+                    - 1.0
+                ) / 1.5,
                 0,
-                1
-            ) * 0.60
+                1,
+            )
+            * 0.60
         )
 
     short_score += (
-        8 * min(1.0, volume_strength)
+        8 * min(
+            1.0,
+            volume_strength,
+        )
     )
 
     structure_score = 0.0
@@ -1427,24 +1774,37 @@ def analyse_at_0945(
         structure_score += 0.20
 
     short_score += (
-        10 * min(1.0, structure_score)
+        10 * min(
+            1.0,
+            structure_score,
+        )
     )
 
-    if np.isfinite(range_expansion):
+    if np.isfinite(
+        range_expansion
+    ):
+
         short_score += (
             5 * clamp(
-                (range_expansion - 0.75) / 0.75,
+                (
+                    range_expansion
+                    - 0.75
+                ) / 0.75,
                 0,
-                1
+                1,
             )
         )
 
-    if np.isfinite(normalized_total_move):
+    if np.isfinite(
+        normalized_total_move
+    ):
+
         short_score += (
             5 * clamp(
-                -normalized_total_move / 2.0,
+                -normalized_total_move
+                / 2.0,
                 0,
-                1
+                1,
             )
         )
 
@@ -1457,15 +1817,20 @@ def analyse_at_0945(
     if short_reversal:
         short_score -= 25
 
-    short_score -= exhaustion_penalty
+    short_score -= (
+        exhaustion_penalty
+    )
 
     if 32 <= rsi <= 55:
+
         short_score += 5
 
     elif 28 <= rsi < 32:
+
         short_score += 2
 
     elif rsi < 22:
+
         short_score -= 5
 
     # ============================================================
@@ -1477,21 +1842,21 @@ def analyse_at_0945(
     long_score += (
         12 * bullish_move_score(
             opening_pct,
-            1.50
+            1.50,
         )
     )
 
     long_score += (
         12 * bullish_move_score(
             confirmation_pct,
-            1.00
+            1.00,
         )
     )
 
     long_score += (
         12 * bullish_move_score(
             relative_total_strength,
-            1.50
+            1.50,
         )
     )
 
@@ -1499,7 +1864,7 @@ def analyse_at_0945(
         10 * clamp(
             vwap_pct / 2.0,
             0,
-            1
+            1,
         )
     )
 
@@ -1511,7 +1876,9 @@ def analyse_at_0945(
     if ema9 > ema20:
         long_ema_structure += 0.50
 
-    long_score += 10 * long_ema_structure
+    long_score += (
+        10 * long_ema_structure
+    )
 
     long_macd_structure = 0.0
 
@@ -1529,31 +1896,51 @@ def analyse_at_0945(
         long_macd_structure += 0.40
 
     long_score += (
-        8 * min(1.0, long_macd_structure)
+        8 * min(
+            1.0,
+            long_macd_structure,
+        )
     )
 
     long_volume_strength = 0.0
 
-    if np.isfinite(opening_rvol):
+    if np.isfinite(
+        opening_rvol
+    ):
+
         long_volume_strength += (
             clamp(
-                (opening_rvol - 1.0) / 1.5,
+                (
+                    opening_rvol
+                    - 1.0
+                ) / 1.5,
                 0,
-                1
-            ) * 0.40
+                1,
+            )
+            * 0.40
         )
 
-    if np.isfinite(confirmation_rvol):
+    if np.isfinite(
+        confirmation_rvol
+    ):
+
         long_volume_strength += (
             clamp(
-                (confirmation_rvol - 1.0) / 1.5,
+                (
+                    confirmation_rvol
+                    - 1.0
+                ) / 1.5,
                 0,
-                1
-            ) * 0.60
+                1,
+            )
+            * 0.60
         )
 
     long_score += (
-        8 * min(1.0, long_volume_strength)
+        8 * min(
+            1.0,
+            long_volume_strength,
+        )
     )
 
     long_structure = 0.0
@@ -1568,24 +1955,36 @@ def analyse_at_0945(
         long_structure += 0.20
 
     long_score += (
-        10 * min(1.0, long_structure)
+        10 * min(
+            1.0,
+            long_structure,
+        )
     )
 
-    if np.isfinite(range_expansion):
+    if np.isfinite(
+        range_expansion
+    ):
+
         long_score += (
             5 * clamp(
-                (range_expansion - 0.75) / 0.75,
+                (
+                    range_expansion
+                    - 0.75
+                ) / 0.75,
                 0,
-                1
+                1,
             )
         )
 
-    if np.isfinite(normalized_total_move):
+    if np.isfinite(
+        normalized_total_move
+    ):
+
         long_score += (
             5 * clamp(
                 normalized_total_move / 2.0,
                 0,
-                1
+                1,
             )
         )
 
@@ -1604,17 +2003,19 @@ def analyse_at_0945(
     short_score = clamp(
         short_score,
         0,
-        100
+        100,
     )
 
     long_score = clamp(
         long_score,
         0,
-        100
+        100,
     )
 
     turnover_cr = (
-        float(confirmation["Volume"])
+        float(
+            confirmation["Volume"]
+        )
         * decision_price
         / 10_000_000
     )
@@ -1623,10 +2024,13 @@ def analyse_at_0945(
     conviction = "NEUTRAL"
 
     if (
-        short_score >= SHORT_TRADEABLE_SCORE
+        short_score
+        >= SHORT_TRADEABLE_SCORE
         and short_score >= long_score
-        and total_pct <= -MIN_SHORT_TOTAL_MOVE
-        and opening_pct <= -MIN_OPENING_SHORT_MOVE
+        and total_pct
+        <= -MIN_SHORT_TOTAL_MOVE
+        and opening_pct
+        <= -MIN_OPENING_SHORT_MOVE
         and not short_reversal
     ):
 
@@ -1636,15 +2040,19 @@ def analyse_at_0945(
 
         conviction = (
             "HIGH"
-            if short_score >= SHORT_HIGH_CONVICTION_SCORE
+            if short_score
+            >= SHORT_HIGH_CONVICTION_SCORE
             else "TRADEABLE"
         )
 
     elif (
-        long_score >= LONG_TRADEABLE_SCORE
+        long_score
+        >= LONG_TRADEABLE_SCORE
         and long_score > short_score
-        and total_pct >= MIN_LONG_TOTAL_MOVE
-        and opening_pct >= MIN_OPENING_LONG_MOVE
+        and total_pct
+        >= MIN_LONG_TOTAL_MOVE
+        and opening_pct
+        >= MIN_OPENING_LONG_MOVE
         and not long_reversal
     ):
 
@@ -1654,7 +2062,8 @@ def analyse_at_0945(
 
         conviction = (
             "HIGH"
-            if long_score >= LONG_HIGH_CONVICTION_SCORE
+            if long_score
+            >= LONG_HIGH_CONVICTION_SCORE
             else "TRADEABLE"
         )
 
@@ -1662,16 +2071,28 @@ def analyse_at_0945(
 
         score = max(
             short_score,
-            long_score
+            long_score,
         )
 
     return {
-        "Ticker": ticker.replace(".NS", ""),
+        "Ticker": ticker.replace(
+            ".NS",
+            "",
+        ),
         "Signal": signal,
         "Conviction": conviction,
-        "Score": round(score, 2),
-        "Short Score": round(short_score, 2),
-        "Long Score": round(long_score, 2),
+        "Score": round(
+            score,
+            2,
+        ),
+        "Short Score": round(
+            short_score,
+            2,
+        ),
+        "Long Score": round(
+            long_score,
+            2,
+        ),
         "Opening %": opening_pct,
         "09:30-09:45 %": confirmation_pct,
         "Total %": total_pct,
@@ -1714,32 +2135,67 @@ def analyse_at_0945(
 
 def scan_live(
     target_date: pd.Timestamp
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, ScanStats]:
+
+    stats = ScanStats()
 
     universe = build_universe()
 
-    print(
-        f"Universe: {len(universe)} stocks"
+    stats.universe = len(universe)
+
+    logger.info(
+        "Universe: %d stocks",
+        len(universe),
+    )
+
+    if not universe:
+        raise RuntimeError(
+            "NSE universe is empty."
+        )
+
+    # ------------------------------------------------------------
+    # NIFTY
+    # ------------------------------------------------------------
+
+    logger.info(
+        "Downloading NIFTY benchmark..."
     )
 
     nifty = download_nifty_data(
         target_date
     )
 
+    if nifty.empty:
+        raise RuntimeError(
+            "NIFTY benchmark data unavailable."
+        )
+
     (
         nifty_opening_return,
-        nifty_total_return
+        nifty_total_return,
     ) = calculate_market_returns(
         nifty,
-        target_date
+        target_date,
     )
 
-    print(
-        "NIFTY 09:45 return: "
-        f"{nifty_total_return:+.2f}%"
-        if np.isfinite(nifty_total_return)
-        else "NIFTY benchmark unavailable"
-    )
+    if np.isfinite(
+        nifty_total_return
+    ):
+
+        logger.info(
+            "NIFTY 09:45 return: %+0.2f%%",
+            nifty_total_return,
+        )
+
+    else:
+
+        raise RuntimeError(
+            "NIFTY 09:15/09:30 signal bars unavailable."
+        )
+
+    # ------------------------------------------------------------
+    # STOCKS
+    # ------------------------------------------------------------
 
     all_results = []
 
@@ -1750,7 +2206,7 @@ def scan_live(
     for start_idx in range(
         0,
         total,
-        BATCH_SIZE
+        BATCH_SIZE,
     ):
 
         batch = universe[
@@ -1761,19 +2217,28 @@ def scan_live(
         batch_data = (
             download_intraday_batch(
                 batch,
-                target_date
+                target_date,
             )
+        )
+
+        stats.downloaded += len(
+            batch_data
+        )
+
+        stats.failed_download += (
+            len(batch)
+            - len(batch_data)
         )
 
         for ticker in batch:
 
             processed += 1
 
-            print(
-                f"\rScanning "
-                f"{processed}/{total}",
-                end="",
-                flush=True
+            logger.info(
+                "Scanning %d/%d: %s",
+                processed,
+                total,
+                ticker,
             )
 
             raw_df = batch_data.get(
@@ -1781,6 +2246,12 @@ def scan_live(
             )
 
             if raw_df is None:
+
+                logger.warning(
+                    "No data for %s",
+                    ticker,
+                )
+
                 continue
 
             try:
@@ -1796,31 +2267,55 @@ def scan_live(
                 if analysis is None:
                     continue
 
+                stats.analyzed += 1
+
                 if (
                     analysis["Turnover Cr"]
                     < MIN_TURNOVER_CR
                 ):
+
+                    stats.rejected_liquidity += 1
+
                     continue
 
                 if analysis["Signal"] not in (
                     "SHORT",
-                    "LONG"
+                    "LONG",
                 ):
+
                     continue
 
                 all_results.append(
                     analysis
                 )
 
-            except Exception:
-                continue
+            except Exception as exc:
 
-        time.sleep(BATCH_DELAY)
+                logger.exception(
+                    "Analysis failed for %s: %s",
+                    ticker,
+                    exc,
+                )
 
-    print()
+        if (
+            start_idx + BATCH_SIZE
+            < total
+        ):
+
+            time.sleep(
+                BATCH_DELAY
+            )
 
     if not all_results:
-        return pd.DataFrame()
+
+        logger.info(
+            "No actionable signals."
+        )
+
+        return (
+            pd.DataFrame(),
+            stats,
+        )
 
     results = pd.DataFrame(
         all_results
@@ -1829,16 +2324,39 @@ def scan_live(
     results["Rank Score"] = np.where(
         results["Signal"] == "SHORT",
         results["Short Score"],
-        results["Long Score"]
+        results["Long Score"],
     )
 
-    return (
+    results = (
         results
         .sort_values(
             "Rank Score",
-            ascending=False
+            ascending=False,
         )
         .reset_index(drop=True)
+    )
+
+    stats.actionable = len(
+        results
+    )
+
+    stats.shorts = int(
+        (
+            results["Signal"]
+            == "SHORT"
+        ).sum()
+    )
+
+    stats.longs = int(
+        (
+            results["Signal"]
+            == "LONG"
+        ).sum()
+    )
+
+    return (
+        results,
+        stats,
     )
 
 
@@ -1859,7 +2377,8 @@ def safe_float(
 
 def build_telegram_message(
     results: pd.DataFrame,
-    target_date: pd.Timestamp
+    target_date: pd.Timestamp,
+    stats: ScanStats,
 ) -> str:
 
     timestamp = pd.Timestamp.now(
@@ -1880,101 +2399,129 @@ def build_telegram_message(
             "⚪ NO ACTIONABLE SIGNALS",
             "",
             "No stock passed the configured "
-            "09:45 criteria."
+            "09:45 criteria.",
         ])
 
-        return "\n".join(lines)
-
-    shorts = (
-        results[
-            results["Signal"] == "SHORT"
-        ]
-        .sort_values(
-            "Short Score",
-            ascending=False
-        )
-        .head(TOP_SHORTS_TO_SHOW)
-    )
-
-    longs = (
-        results[
-            results["Signal"] == "LONG"
-        ]
-        .sort_values(
-            "Long Score",
-            ascending=False
-        )
-        .head(TOP_LONGS_TO_SHOW)
-    )
-
-    lines.append(
-        "🔴 SHORT CANDIDATES"
-    )
-
-    if shorts.empty:
-
-        lines.append(
-            "None"
-        )
-
     else:
 
-        for rank, (_, row) in enumerate(
-            shorts.iterrows(),
-            start=1
-        ):
-
-            lines.append(
-                f"{rank}. {row['Ticker']} | "
-                f"S={row['Short Score']:.0f} | "
-                f"Move={row['Total %']:+.2f}% | "
-                f"RVOL={safe_float(row['Confirmation RVOL'], 2)}x | "
-                f"RSI={safe_float(row['RSI'], 1)}"
+        shorts = (
+            results[
+                results["Signal"]
+                == "SHORT"
+            ]
+            .sort_values(
+                "Short Score",
+                ascending=False,
             )
+            .head(
+                TOP_SHORTS_TO_SHOW
+            )
+        )
 
-            if row["Exhaustion Flags"]:
+        longs = (
+            results[
+                results["Signal"]
+                == "LONG"
+            ]
+            .sort_values(
+                "Long Score",
+                ascending=False,
+            )
+            .head(
+                TOP_LONGS_TO_SHOW
+            )
+        )
+
+        lines.append(
+            "🔴 SHORT CANDIDATES"
+        )
+
+        if shorts.empty:
+
+            lines.append("None")
+
+        else:
+
+            for rank, (
+                _,
+                row,
+            ) in enumerate(
+                shorts.iterrows(),
+                start=1,
+            ):
 
                 lines.append(
-                    "   ⚠ "
-                    + row["Exhaustion Flags"]
+                    f"{rank}. "
+                    f"{row['Ticker']} | "
+                    f"S={row['Short Score']:.0f} | "
+                    f"Move={row['Total %']:+.2f}% | "
+                    f"RVOL="
+                    f"{safe_float(row['Confirmation RVOL'], 2)}x | "
+                    f"RSI="
+                    f"{safe_float(row['RSI'], 1)}"
                 )
 
-    lines.append("")
+                if row[
+                    "Exhaustion Flags"
+                ]:
 
-    lines.append(
-        "🟢 LONG CANDIDATES"
-    )
+                    lines.append(
+                        "   ⚠ "
+                        + row[
+                            "Exhaustion Flags"
+                        ]
+                    )
 
-    if longs.empty:
+        lines.append("")
 
         lines.append(
-            "None"
+            "🟢 LONG CANDIDATES"
         )
 
-    else:
+        if longs.empty:
 
-        for rank, (_, row) in enumerate(
-            longs.iterrows(),
-            start=1
-        ):
+            lines.append("None")
 
-            lines.append(
-                f"{rank}. {row['Ticker']} | "
-                f"S={row['Long Score']:.0f} | "
-                f"Move={row['Total %']:+.2f}% | "
-                f"RVOL={safe_float(row['Confirmation RVOL'], 2)}x | "
-                f"RSI={safe_float(row['RSI'], 1)}"
-            )
+        else:
+
+            for rank, (
+                _,
+                row,
+            ) in enumerate(
+                longs.iterrows(),
+                start=1,
+            ):
+
+                lines.append(
+                    f"{rank}. "
+                    f"{row['Ticker']} | "
+                    f"S={row['Long Score']:.0f} | "
+                    f"Move={row['Total %']:+.2f}% | "
+                    f"RVOL="
+                    f"{safe_float(row['Confirmation RVOL'], 2)}x | "
+                    f"RSI="
+                    f"{safe_float(row['RSI'], 1)}"
+                )
+
+        lines.extend([
+            "",
+            "────────────────────",
+        ])
 
     lines.extend([
-        "",
-        "────────────────────",
-        f"Actionable: {len(results)}",
-        f"Shorts: {len(shorts)}",
-        f"Longs: {len(longs)}",
+        f"Universe: {stats.universe}",
+        f"Downloaded: {stats.downloaded}",
+        f"Download failures: "
+        f"{stats.failed_download}",
+        f"Analyzed: {stats.analyzed}",
+        f"Liquidity rejected: "
+        f"{stats.rejected_liquidity}",
+        f"Actionable: {stats.actionable}",
+        f"Shorts: {stats.shorts}",
+        f"Longs: {stats.longs}",
         "",
         "Research scanner only. "
-        "Signal ≠ guaranteed return."
+        "Signal ≠ guaranteed return.",
     ])
 
     return "\n".join(lines)
@@ -1986,6 +2533,12 @@ def build_telegram_message(
 
 def run_live_scan() -> pd.DataFrame:
 
+    # ------------------------------------------------------------
+    # Validate configuration BEFORE expensive downloads.
+    # ------------------------------------------------------------
+
+    validate_configuration()
+
     now = pd.Timestamp.now(
         tz=MARKET_TZ
     )
@@ -1996,24 +2549,41 @@ def run_live_scan() -> pd.DataFrame:
         .normalize()
     )
 
-    print(
-        f"Live scanner started: "
-        f"{now:%Y-%m-%d %H:%M:%S %Z}"
+    logger.info(
+        "Live scanner started: "
+        "%s",
+        now.strftime(
+            "%Y-%m-%d %H:%M:%S %Z"
+        ),
     )
 
-    results = scan_live(
+    start_time = time.monotonic()
+
+    results, stats = scan_live(
         target_date
+    )
+
+    elapsed = (
+        time.monotonic()
+        - start_time
+    )
+
+    logger.info(
+        "Scan completed in %.2f seconds.",
+        elapsed,
     )
 
     message = build_telegram_message(
         results,
-        target_date
+        target_date,
+        stats,
     )
 
     print()
     print(message)
     print()
 
+    # Exactly one Telegram message.
     send_telegram_message(
         message
     )
