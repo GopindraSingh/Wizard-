@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+.env
+upstox_nse_instruments.json
+*.log
